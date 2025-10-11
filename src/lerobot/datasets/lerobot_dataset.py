@@ -529,6 +529,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         revision: str | None = None,
         force_cache_sync: bool = False,
         download_videos: bool = True,
+        batch_encoding_size: int = 1,
         video_backend: str | None = None,
         async_video_encoding: bool = False,
         video_encoding_workers: int = 2,
@@ -1282,7 +1283,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
             # TODO: https://github.com/huggingface/lerobot/issues/2161
             # the muxer only concatenation seems to have a problem with non monotonically increasing timestamps.
-            if not latest_path.exists() or get_video_size_in_mb(latest_path) + ep_size_in_mb >= self.meta.video_files_size_in_mb:
+            # if not latest_path.exists() or get_video_size_in_mb(latest_path) + ep_size_in_mb >= self.meta.video_files_size_in_mb:
+            if True:
                 # Move temporary episode video to a new video file in the dataset
                 chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
                 new_path = self.root / self.meta.video_path.format(
@@ -1416,6 +1418,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         tolerance_s: float = 1e-4,
         image_writer_processes: int = 0,
         image_writer_threads: int = 0,
+        batch_encoding_size: int = 1,
         video_backend: str | None = None,
         async_video_encoding: bool = False,
         video_encoding_workers: int = 2,
