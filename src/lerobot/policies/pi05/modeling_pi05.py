@@ -423,17 +423,13 @@ class PaliGemmaWithExpertModel(
             self.paligemma.model.vision_tower.eval()
             for param in self.paligemma.model.vision_tower.parameters():
                 param.requires_grad = False
-        if self.train_expert_only:
-            self.paligemma.eval()
-            for param in self.paligemma.parameters():
-                param.requires_grad = False
+        # train_expert_only uses knowledge insulation: VLM stays trainable (receives CE gradients),
+        # but the action expert's MSE gradients are blocked by a detach() in PI05Pytorch.forward().
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self.freeze_vision_encoder:
             self.paligemma.model.vision_tower.eval()
-        if self.train_expert_only:
-            self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
         # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
@@ -579,6 +575,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+
+        if config.train_expert_only:
+            # Knowledge insulation: learnable slot embeddings (one per action timestep) are appended
+            # to the VLM prefix so the backbone can predict discretized action bins via CE loss.
+            self.action_step_emb = nn.Embedding(config.chunk_size, paligemma_config.width)
+            self.action_ki_head = nn.Linear(
+                paligemma_config.width, config.max_action_dim * config.ki_n_bins
+            )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -728,8 +732,74 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
+    def _discretize_actions(self, actions: Tensor) -> Tensor:
+        """Bin continuous actions (assumed in [-1, 1]) into integer indices in [0, ki_n_bins)."""
+        n = self.config.ki_n_bins
+        indices = ((actions.float() + 1.0) / 2.0 * n).long()
+        return indices.clamp(0, n - 1)
+
+    def _compute_ki_ce_loss(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        actions: Tensor,
+    ) -> Tensor:
+        """VLM-only forward pass for the knowledge insulation CE loss.
+
+        Appends one learnable slot embedding per action timestep to the prefix, runs the VLM
+        backbone, and predicts discretized per-dimension action bins at those positions.
+        """
+        bsize, device = prefix_embs.shape[0], prefix_embs.device
+
+        # Build action-step slot embeddings [B, chunk_size, vlm_width]
+        step_idx = torch.arange(self.config.chunk_size, device=device)
+        step_embs = self.action_step_emb(step_idx)  # [chunk_size, width]
+        vlm_width = step_embs.shape[-1]
+        step_embs = step_embs * math.sqrt(vlm_width)
+        step_embs = step_embs.unsqueeze(0).expand(bsize, -1, -1)
+        if prefix_embs.dtype == torch.bfloat16:
+            step_embs = step_embs.to(torch.bfloat16)
+
+        # Combine prefix with action-step slots; all slots use att_mask=False (bidirectional)
+        combined_embs = torch.cat([prefix_embs, step_embs], dim=1)
+        step_pad = torch.ones(bsize, self.config.chunk_size, dtype=torch.bool, device=device)
+        combined_pad = torch.cat([prefix_pad_masks, step_pad], dim=1)
+        step_att = torch.zeros(bsize, self.config.chunk_size, dtype=torch.bool, device=device)
+        combined_att = torch.cat([prefix_att_masks, step_att], dim=1)
+
+        att_2d = make_att_2d_masks(combined_pad, combined_att)
+        position_ids = torch.cumsum(combined_pad, dim=1) - 1
+        att_2d_4d = self._prepare_attention_masks_4d(att_2d)
+
+        # VLM-only forward: inputs_embeds[1]=None triggers the prefix-only path
+        (prefix_out, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[combined_embs, None],
+            use_cache=False,
+        )
+
+        # Hidden states at action-step slot positions
+        action_hidden = prefix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+
+        # Project to per-dimension bin logits and compute CE against discretized targets
+        logits = self.action_ki_head(action_hidden)  # [B, chunk_size, action_dim * n_bins]
+        logits = logits.view(bsize, self.config.chunk_size, self.config.max_action_dim, self.config.ki_n_bins)
+        targets = self._discretize_actions(actions)  # [B, chunk_size, action_dim]
+
+        # cross_entropy expects [N, C, *] input and [N, *] target
+        return F.cross_entropy(logits.permute(0, 3, 1, 2), targets)
+
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor | tuple[Tensor, Tensor]:
+        """Do a full training forward pass and compute the loss.
+
+        Returns:
+            When train_expert_only=False: MSE loss tensor [B, chunk_size, max_action_dim].
+            When train_expert_only=True (knowledge insulation): tuple of
+                (mse_losses [B, chunk_size, max_action_dim], ce_loss scalar).
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -750,6 +820,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
+        # Knowledge insulation: VLM backbone trained with discrete action CE loss; action expert
+        # trained with flow-matching MSE loss. Stop-gradient (detach) blocks MSE gradients from
+        # reaching the VLM, while the CE pass provides the backbone with motor-control representations.
+        if self.config.train_expert_only:
+            ce_loss = self._compute_ki_ce_loss(prefix_embs, prefix_pad_masks, prefix_att_masks, actions)
+            # Detach prefix so action expert MSE gradients cannot update the VLM backbone.
+            mse_prefix_embs = prefix_embs.detach()
+        else:
+            mse_prefix_embs = prefix_embs
+
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
@@ -758,19 +838,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+        def forward_func(mse_prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
+                inputs_embeds=[mse_prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
             return suffix_out
 
         suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            forward_func, mse_prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
@@ -781,7 +861,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        mse_losses = F.mse_loss(u_t, v_t, reduction="none")
+
+        if self.config.train_expert_only:
+            return mse_losses, self.config.ki_alpha * ce_loss
+
+        return mse_losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1263,24 +1348,34 @@ class PI05Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        result = self.model.forward(images, img_masks, tokens, masks, actions)
 
-        # Truncate losses to actual action dimensions
+        # Knowledge insulation returns (mse_losses, scaled_ce_loss); plain training returns mse_losses.
+        if isinstance(result, tuple):
+            losses, ce_loss = result
+        else:
+            losses, ce_loss = result, None
+
+        # Truncate MSE losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
+        if ce_loss is not None:
+            loss_dict["ki_ce_loss"] = ce_loss.detach().item()
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
+            if ce_loss is not None:
+                per_sample_loss = per_sample_loss + ce_loss
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss
             loss = losses.mean()
+            if ce_loss is not None:
+                loss = loss + ce_loss
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

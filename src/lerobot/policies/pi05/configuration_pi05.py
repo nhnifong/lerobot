@@ -85,7 +85,12 @@ class PI05Config(PreTrainedConfig):
 
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
-    train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # Knowledge insulation: VLM trained with discrete action CE loss; action expert trained with
+    # flow-matching MSE; stop-gradient blocks MSE from reaching VLM backbone.
+    # See https://www.pi.website/research/knowledge_insulation
+    train_expert_only: bool = False
+    ki_alpha: float = 1.0  # Weight of backbone CE loss relative to flow-matching MSE loss
+    ki_n_bins: int = 256  # Quantization bins per action dimension for discrete action targets
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
