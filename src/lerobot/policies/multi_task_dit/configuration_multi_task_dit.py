@@ -225,13 +225,6 @@ class MultiTaskDiTConfig(PreTrainedConfig):
                     self.image_crop_shape = None
                     break
 
-        if len(self.image_features) > 0:
-            first_key, first_ft = next(iter(self.image_features.items()))
-            for key, image_ft in self.image_features.items():
-                if image_ft.shape != first_ft.shape:
-                    raise ValueError(
-                        f"Image '{key}' shape {image_ft.shape} != '{first_key}' shape {first_ft.shape}"
-                    )
 
     @property
     def is_diffusion(self) -> bool:
